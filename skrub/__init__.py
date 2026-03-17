@@ -10,6 +10,7 @@ from ._apply_to_cols import ApplyToCols
 from ._apply_to_each_col import ApplyToEachCol
 from ._apply_to_sub_frame import ApplyToSubFrame
 from ._column_associations import column_associations
+from ._class_prior_text_encoder import ClassPriorTextEncoder
 from ._config import config_context, get_config, set_config
 from ._data_ops import (
     DataOp,
@@ -95,6 +96,7 @@ __all__ = [
     "choose_bool",
     "selectors",
     "TextEncoder",
+    "ClassPriorTextEncoder",
     "StringEncoder",
     "column_associations",
     "SquashingScaler",
