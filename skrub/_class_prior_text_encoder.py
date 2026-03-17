@@ -213,6 +213,11 @@ class ClassPriorTextEncoder(SingleColumnTransformer):
         pair_loss_prefilter_factor=4,
         pair_loss_warmup_epochs=3,
         pair_loss_eps=1e-8,
+        pull_level_weights=None,
+        sibling_repulsion_weight=1.0,
+        inter_repulsion_weight=0.2,
+        inter_pair_loss_top_m=None,
+        sibling_parent_variance_beta=1.0,
     ):
         self.model_name = model_name
         self.n_components = n_components
@@ -236,6 +241,11 @@ class ClassPriorTextEncoder(SingleColumnTransformer):
         self.pair_loss_prefilter_factor = pair_loss_prefilter_factor
         self.pair_loss_warmup_epochs = pair_loss_warmup_epochs
         self.pair_loss_eps = pair_loss_eps
+        self.pull_level_weights = pull_level_weights
+        self.sibling_repulsion_weight = sibling_repulsion_weight
+        self.inter_repulsion_weight = inter_repulsion_weight
+        self.inter_pair_loss_top_m = inter_pair_loss_top_m
+        self.sibling_parent_variance_beta = sibling_parent_variance_beta
 
     def fit_transform(self, column, y=None):
         """Fit the TextEncoder from ``column``.
@@ -314,18 +324,19 @@ class ClassPriorTextEncoder(SingleColumnTransformer):
                     "prior was applied."
                 )
         else:
-            classes = self._normalize_categories(
+            category_levels = self._normalize_category_levels(
                 categories=y,
                 n_samples=X_out.shape[0],
                 arg_name="y",
             )
+            classes = category_levels[-1]
             if self.projection_output_dim is not None and not self.train_projection_head:
                 raise ValueError(
                     "projection_output_dim is set but train_projection_head=False. "
                     "Please enable train_projection_head to learn the projection."
                 )
             if self.train_projection_head:
-                X_out = self._fit_projection_head(X_out, classes)
+                X_out = self._fit_projection_head(X_out, category_levels)
             self._fit_class_priors(X_out, classes)
             X_out = self._apply_class_prior(X_out, classes)
 
@@ -379,11 +390,12 @@ class ClassPriorTextEncoder(SingleColumnTransformer):
                     "prior was applied."
                 )
             else:
-                classes = self._normalize_categories(
+                category_levels = self._normalize_category_levels(
                     categories=class_categories,
                     n_samples=X_out.shape[0],
                     arg_name="class_categories",
                 )
+                classes = category_levels[-1]
                 X_out = self._apply_class_prior(X_out, classes)
 
         cols = self.get_feature_names_out()
@@ -399,6 +411,24 @@ class ClassPriorTextEncoder(SingleColumnTransformer):
                 f"`{arg_name}` has length {classes.shape[0]} but expected {n_samples}."
             )
         return classes
+
+    def _normalize_category_levels(self, categories, n_samples, arg_name):
+        arr = np.asarray(categories, dtype=object)
+        if arr.ndim == 1:
+            levels = [arr.ravel()]
+        elif arr.ndim == 2 and arr.shape[1] >= 1:
+            levels = [arr[:, idx].ravel() for idx in range(arr.shape[1])]
+        else:
+            raise ValueError(
+                f"`{arg_name}` must be 1D labels or 2D hierarchical labels. "
+                f"Got shape {arr.shape}."
+            )
+        for level in levels:
+            if level.shape[0] != n_samples:
+                raise ValueError(
+                    f"`{arg_name}` has length {level.shape[0]} but expected {n_samples}."
+                )
+        return levels
 
     def _fit_class_priors(self, X_out, classes):
         X_np = np.asarray(X_out, dtype=float)
@@ -419,7 +449,7 @@ class ClassPriorTextEncoder(SingleColumnTransformer):
             mask = classes == class_name
             self.class_priors_[class_name] = X_np[mask].mean(axis=0)
 
-    def _fit_projection_head(self, X_out, classes):
+    def _fit_projection_head(self, X_out, category_levels):
         torch = import_optional_dependency(
             "torch",
             extra=(
@@ -435,7 +465,8 @@ class ClassPriorTextEncoder(SingleColumnTransformer):
             if self.projection_output_dim is not None
             else int(n_features)
         )
-        null_mask = self._is_null(classes)
+        leaf_classes = category_levels[-1]
+        null_mask = self._is_null(leaf_classes)
         if null_mask.all():
             warnings.warn(
                 "All class categories are missing, projection-head training was skipped."
@@ -444,17 +475,34 @@ class ClassPriorTextEncoder(SingleColumnTransformer):
 
         valid_mask = ~null_mask
         X_train = X_np[valid_mask]
-        classes_train = classes[valid_mask]
+        levels_train = [level[valid_mask] for level in category_levels]
 
-        class_to_idx = {}
-        y_idx = np.empty(X_train.shape[0], dtype=np.int64)
-        for i, class_name in enumerate(classes_train):
-            if class_name not in class_to_idx:
-                class_to_idx[class_name] = len(class_to_idx)
-            y_idx[i] = class_to_idx[class_name]
+        level_ids = []
+        level_n_classes = []
+        for level_values in levels_train:
+            ids = np.full(level_values.shape[0], -1, dtype=np.int64)
+            mapping = {}
+            for i, class_name in enumerate(level_values):
+                if class_name not in mapping:
+                    mapping[class_name] = len(mapping)
+                ids[i] = mapping[class_name]
+            level_ids.append(ids)
+            level_n_classes.append(len(mapping))
+
+        # Build leaf->parent ids for sibling selection at the deepest level.
+        if len(level_ids) >= 2:
+            leaf_to_parent = np.full(level_n_classes[-1], -1, dtype=np.int64)
+            for row_idx, leaf_id in enumerate(level_ids[-1]):
+                if leaf_to_parent[leaf_id] == -1:
+                    leaf_to_parent[leaf_id] = level_ids[-2][row_idx]
+        else:
+            leaf_to_parent = np.full(level_n_classes[-1], -1, dtype=np.int64)
+
+        level_ids_t = [torch.from_numpy(ids) for ids in level_ids]
+        pull_weights = self._resolve_pull_level_weights(len(level_ids))
 
         X_t = torch.from_numpy(X_train)
-        y_t = torch.from_numpy(y_idx)
+        y_t = level_ids_t[-1]
         head = torch.nn.Linear(n_features, output_dim)
         with torch.no_grad():
             head.weight.zero_()
@@ -470,6 +518,9 @@ class ClassPriorTextEncoder(SingleColumnTransformer):
 
         sep_weight = float(self.separation_weight)
         eps = float(self.pair_loss_eps)
+        sibling_weight = float(self.sibling_repulsion_weight)
+        inter_weight = float(self.inter_repulsion_weight)
+        parent_var_beta = float(self.sibling_parent_variance_beta)
         progress_iter = range(int(self.projection_n_epochs))
         progress_bar = None
         if self.verbose:
@@ -491,14 +542,21 @@ class ClassPriorTextEncoder(SingleColumnTransformer):
             optimizer.zero_grad()
             Z = head(X_t)
 
-            centroids = []
-            for class_id in range(len(class_to_idx)):
-                class_mask = y_t == class_id
-                centroids.append(Z[class_mask].mean(dim=0))
-            C = torch.stack(centroids, dim=0)
+            level_centroids = []
+            pull_loss = torch.tensor(0.0, dtype=Z.dtype, device=Z.device)
+            for level_idx, ids_t in enumerate(level_ids_t):
+                n_classes_level = level_n_classes[level_idx]
+                centroids = []
+                for class_id in range(n_classes_level):
+                    class_mask = ids_t == class_id
+                    centroids.append(Z[class_mask].mean(dim=0))
+                C_level = torch.stack(centroids, dim=0)
+                level_centroids.append(C_level)
+                z_targets = C_level[ids_t]
+                level_pull = torch.mean(torch.sum((Z - z_targets) ** 2, dim=1))
+                pull_loss = pull_loss + float(pull_weights[level_idx]) * level_pull
 
-            z_targets = C[y_t]
-            pull_loss = torch.mean(torch.sum((Z - z_targets) ** 2, dim=1))
+            C = level_centroids[-1]
 
             sep_loss = torch.tensor(0.0, dtype=Z.dtype)
             n_classes = C.shape[0]
@@ -530,7 +588,8 @@ class ClassPriorTextEncoder(SingleColumnTransformer):
                         pair_dist, k=pre_n, largest=False
                     ).indices
 
-                pair_scores = []
+                sibling_scores = []
+                inter_scores = []
                 for idx in candidate_idx:
                     i = left_idx[idx]
                     j = right_idx[idx]
@@ -544,13 +603,47 @@ class ClassPriorTextEncoder(SingleColumnTransformer):
                     proj_j = centered_j @ direction
                     std_i = torch.sqrt(torch.mean(proj_i * proj_i) + eps)
                     std_j = torch.sqrt(torch.mean(proj_j * proj_j) + eps)
-                    pair_scores.append((std_i + std_j) / dist)
+                    base_score = (std_i + std_j) / dist
 
-                pair_scores_t = torch.stack(pair_scores)
-                if not use_all_pairs:
-                    k = min(int(self.pair_loss_top_m), int(pair_scores_t.shape[0]))
-                    pair_scores_t = torch.topk(pair_scores_t, k=k, largest=True).values
-                sep_loss = pair_scores_t.mean()
+                    i_leaf = int(i.item())
+                    j_leaf = int(j.item())
+                    same_parent = (
+                        len(level_ids) >= 2
+                        and leaf_to_parent[i_leaf] >= 0
+                        and leaf_to_parent[i_leaf] == leaf_to_parent[j_leaf]
+                    )
+                    if same_parent:
+                        parent_id = int(leaf_to_parent[i_leaf])
+                        parent_ids = level_ids_t[-2]
+                        parent_center = level_centroids[-2][parent_id]
+                        parent_centered = Z[parent_ids == parent_id] - parent_center
+                        parent_proj = parent_centered @ direction
+                        parent_var = torch.mean(parent_proj * parent_proj)
+                        mod = 1.0 / (1.0 + parent_var_beta * parent_var)
+                        sibling_scores.append(base_score * mod)
+                    else:
+                        inter_scores.append(base_score)
+
+                sibling_loss = self._aggregate_hard_pair_scores(
+                    torch.stack(sibling_scores) if sibling_scores else None,
+                    top_m=int(self.pair_loss_top_m),
+                    use_all_pairs=use_all_pairs,
+                )
+                if sibling_loss is None:
+                    sibling_loss = Z.new_tensor(0.0)
+                inter_top_m = (
+                    int(self.inter_pair_loss_top_m)
+                    if self.inter_pair_loss_top_m is not None
+                    else max(1, int(self.pair_loss_top_m) // 4)
+                )
+                inter_loss = self._aggregate_hard_pair_scores(
+                    torch.stack(inter_scores) if inter_scores else None,
+                    top_m=inter_top_m,
+                    use_all_pairs=use_all_pairs,
+                )
+                if inter_loss is None:
+                    inter_loss = Z.new_tensor(0.0)
+                sep_loss = sibling_weight * sibling_loss + inter_weight * inter_loss
 
             loss = pull_loss + sep_weight * sep_loss
             loss.backward()
@@ -580,6 +673,27 @@ class ClassPriorTextEncoder(SingleColumnTransformer):
             return X_out
         X_np = np.asarray(X_out, dtype=float)
         return X_np @ self.projection_weight_.T + self.projection_bias_
+
+    def _aggregate_hard_pair_scores(self, scores, top_m, use_all_pairs):
+        if scores is None or int(scores.shape[0]) == 0:
+            if scores is not None:
+                return scores.new_tensor(0.0)
+            return None
+        if use_all_pairs or top_m <= 0 or top_m >= int(scores.shape[0]):
+            return scores.mean()
+        return scores.topk(k=top_m, largest=True).values.mean()
+
+    def _resolve_pull_level_weights(self, n_levels):
+        if self.pull_level_weights is None:
+            return np.arange(1.0, n_levels + 1.0, dtype=float)
+        weights = np.asarray(self.pull_level_weights, dtype=float).ravel()
+        if weights.size == 1:
+            return np.repeat(weights, n_levels)
+        if weights.size != n_levels:
+            raise ValueError(
+                f"pull_level_weights has length {weights.size}, expected 1 or {n_levels}."
+            )
+        return weights
 
     def _apply_class_prior(self, X_out, classes):
         alpha = float(self.prior_strength)
@@ -792,6 +906,46 @@ class ClassPriorTextEncoder(SingleColumnTransformer):
         if not (isinstance(self.pair_loss_eps, numbers.Real) and self.pair_loss_eps > 0):
             raise ValueError(
                 f"Got pair_loss_eps={self.pair_loss_eps!r} but expected a positive float."
+            )
+        if self.pull_level_weights is not None:
+            weights = np.asarray(self.pull_level_weights, dtype=float).ravel()
+            if weights.size == 0:
+                raise ValueError("pull_level_weights must not be empty.")
+            if np.any(~np.isfinite(weights)):
+                raise ValueError(
+                    "pull_level_weights must contain only finite numeric values."
+                )
+        if not (
+            isinstance(self.sibling_repulsion_weight, numbers.Real)
+            and self.sibling_repulsion_weight >= 0
+        ):
+            raise ValueError(
+                "Got sibling_repulsion_weight="
+                f"{self.sibling_repulsion_weight!r} but expected a non-negative float."
+            )
+        if not (
+            isinstance(self.inter_repulsion_weight, numbers.Real)
+            and self.inter_repulsion_weight >= 0
+        ):
+            raise ValueError(
+                "Got inter_repulsion_weight="
+                f"{self.inter_repulsion_weight!r} but expected a non-negative float."
+            )
+        if self.inter_pair_loss_top_m is not None and not (
+            isinstance(self.inter_pair_loss_top_m, numbers.Integral)
+            and self.inter_pair_loss_top_m > 0
+        ):
+            raise ValueError(
+                "Got inter_pair_loss_top_m="
+                f"{self.inter_pair_loss_top_m!r} but expected a positive integer or None."
+            )
+        if not (
+            isinstance(self.sibling_parent_variance_beta, numbers.Real)
+            and self.sibling_parent_variance_beta >= 0
+        ):
+            raise ValueError(
+                "Got sibling_parent_variance_beta="
+                f"{self.sibling_parent_variance_beta!r} but expected a non-negative float."
             )
 
     def __getstate__(self):

@@ -87,3 +87,25 @@ def test_projection_output_dim_changes_output_width():
     y = ["A", "A", "B", "B"]
     out = enc.fit_transform(x, y=y)
     assert out.shape[1] == 1
+
+
+def test_hierarchical_categories_use_deepest_level_for_prior():
+    enc = DummyClassPriorTextEncoder(
+        n_components=None, prior_strength=1.0, train_projection_head=False
+    )
+    x = pd.Series(["a", "bb", "ccc", "dddd"])
+    # 2 levels: parent then leaf
+    y = np.asarray(
+        [
+            ["P1", "A"],
+            ["P1", "A"],
+            ["P1", "B"],
+            ["P2", "C"],
+        ],
+        dtype=object,
+    )
+    out = enc.fit_transform(x, y=y).to_numpy()
+    assert np.allclose(out[0], out[1])
+    assert "A" in enc.class_priors_
+    assert "B" in enc.class_priors_
+    assert "C" in enc.class_priors_
